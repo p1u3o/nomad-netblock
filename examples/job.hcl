@@ -18,7 +18,7 @@ job "example" {
         sidecar = false
       }
       config {
-        image   = "ghcr.io/p1u3o/nomad-netblock:0.3.1"
+        image   = "ghcr.io/p1u3o/nomad-netblock:0.3.2"
         args    = ["init"]
         cap_add = ["net_admin"]
       }
@@ -52,7 +52,7 @@ job "example" {
         sidecar = true
       }
       config {
-        image   = "ghcr.io/p1u3o/nomad-netblock:0.3.1"
+        image   = "ghcr.io/p1u3o/nomad-netblock:0.3.2"
         args    = ["watch"]
         cap_add = ["net_admin"]
       }

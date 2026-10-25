@@ -37,7 +37,7 @@ Only the netblock tasks get `cap_add = ["net_admin"]`; never run them privileged
 go vet ./... && go test -race ./...
 sudo NETBLOCK_NFT_IT=1 unshare -n go test -run Integration ./...   # real nft test
 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=0.3.2" -o netblock-linux-amd64 .
-docker build -t nomad-netblock:0.3.2 .
+docker build --build-arg VERSION=0.3.2 -t nomad-netblock:0.3.2 .
 ```
 
 ## License
