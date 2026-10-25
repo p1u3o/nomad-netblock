@@ -18,7 +18,7 @@ import (
 	"time"
 )
 
-var version = "0.3.1-dev"
+var version = "0.3.2"
 
 const (
 	defaultConfPath = "/local/netblock.conf"
@@ -141,10 +141,11 @@ func runInit(path string, nft Runner) int {
 			time.Sleep(3 * time.Second)
 		}
 	}
-	if err := nft.Apply(RenderRuleset(c, dedupe(targets))); err != nil {
+	ex := initExempt(c)
+	if err := nft.Apply(RenderRuleset(c, dedupe(targets), ex)); err != nil {
 		return failClosed(nft, err)
 	}
-	logf("init: applied mode=%s static=%d service_targets=%d dns=%v", c.Mode, len(c.AllowCIDRs), len(dedupe(targets)), dnsDesc(c))
+	logf("init: applied mode=%s static=%d service_targets=%d dns=%v consul_exempt=%s", c.Mode, len(c.AllowCIDRs), len(dedupe(targets)), dnsDesc(c), ex)
 	if consulErr != nil {
 		logf("init: consul incomplete: %v", consulErr)
 		if c.InitRequireConsul {
@@ -239,11 +240,19 @@ func runWatch(ctx context.Context, path string, nft Runner) int {
 			}
 		}
 	}
-	if err := nft.Apply(RenderRuleset(c, dedupe(carried))); err != nil {
+	carried = dedupe(carried)
+	ex, err := resolveExempt(c, selfCgroupFile, cgroupRoot)
+	if err != nil {
+		logf("watch: CGROUP EXEMPT FALLBACK: cannot use cgroupv2 match (%v); Consul exemption falls back to %s", err, ex)
+	}
+	if err := nft.Apply(RenderRuleset(c, carried, ex)); err != nil {
 		logf("watch: re-apply ruleset failed, rules left as they were: %v", err)
 		return 1
 	}
-	logf("watch: ruleset applied mode=%s static=%d carried_targets=%d", c.Mode, len(c.AllowCIDRs), len(carried))
+	logf("watch: ruleset applied mode=%s static=%d carried_targets=%d consul_exempt=%s", c.Mode, len(c.AllowCIDRs), len(carried), ex)
+	if ex.Kind == ExemptCgroup && len(c.ConsulAddrs) > 0 {
+		ex = verifyExempt(ctx, c, nft, carried, ex)
+	}
 	m := NewMetrics(c.Mode)
 	tr := NewTracker(c.RemovalGrace)
 	if c.MetricsAddr != "" {
@@ -302,6 +311,35 @@ func runWatch(ctx context.Context, path string, nft Runner) int {
 			w.scanDrops()
 		}
 	}
+}
+
+var (
+	selfCgroupFile = "/proc/self/cgroup"
+	cgroupRoot     = "/sys/fs/cgroup"
+	probe          = func(ctx context.Context, addrs []netip.AddrPort) { probeExempt(ctx, addrs, 2*time.Second) }
+)
+
+// verifyExempt checks that the cgroupv2 rule matches this process's own sockets (consul_exempt
+// counter moves after a connect attempt). On a kernel that resolves the level against the
+// root cgroup namespace it would never match; then fall back to the uid match and say so.
+func verifyExempt(ctx context.Context, c Config, nft Runner, carried []Target, ex Exempt) Exempt {
+	probe(ctx, c.ConsulAddrs)
+	raw, err := nft.ListJSON("counter", "inet", tableName, "consul_exempt")
+	var p uint64
+	if err == nil {
+		p, _, err = ParseNamedCounter(raw)
+	}
+	if err == nil && p > 0 {
+		logf("watch: cgroupv2 exemption verified (consul_exempt packets=%d)", p)
+		return ex
+	}
+	fb := uidFallback(c)
+	logf("watch: CGROUP EXEMPT FALLBACK: cgroupv2 rule did not match our own Consul connect (packets=%d err=%v); falling back to %s", p, err, fb)
+	if aerr := nft.Apply(RenderRuleset(c, carried, fb)); aerr != nil {
+		logf("watch: fallback re-apply failed, cgroupv2 rule stays: %v", aerr)
+		return ex
+	}
+	return fb
 }
 
 type watcher struct {

@@ -107,7 +107,7 @@ func sortTargets(ts []Target) {
 
 // RenderRuleset builds the full table. Policy is drop for both families in every mode;
 // audit mode only changes the final verdict for packets that would have been dropped.
-func RenderRuleset(c Config, targets []Target) string {
+func RenderRuleset(c Config, targets []Target, ex Exempt) string {
 	var b strings.Builder
 	header(&b)
 	fmt.Fprintf(&b, "table inet %s {\n", tableName)
@@ -115,23 +115,22 @@ func RenderRuleset(c Config, targets []Target) string {
 	b.WriteString("  set svc6 { type ipv6_addr . inet_service; }\n")
 	fmt.Fprintf(&b, "  set drop4 { type inet_proto . ipv4_addr . inet_service; size 4096; flags dynamic,timeout; timeout %s; }\n", dropSetTTL)
 	fmt.Fprintf(&b, "  set drop6 { type inet_proto . ipv6_addr . inet_service; size 4096; flags dynamic,timeout; timeout %s; }\n", dropSetTTL)
-	b.WriteString("  counter would_drop {}\n  counter allowed_svc {}\n  counter ipv6_rs {}\n")
+	b.WriteString("  counter would_drop {}\n  counter allowed_svc {}\n  counter ipv6_rs {}\n  counter consul_exempt {}\n")
 	b.WriteString("  chain output {\n    type filter hook output priority filter; policy drop;\n")
 	b.WriteString("    oif \"lo\" accept\n    ct state established,related accept\n    ct state invalid drop\n")
 	if !c.DNSNone {
 		dnsRules(&b, c.DNSResolvers)
 	}
-	// Consul API: only the netblock process (skuid) when run_as is set, so the app cannot reach it.
-	owner := ""
-	if c.RunAsUID > 0 {
-		owner = fmt.Sprintf("meta skuid %d ", c.RunAsUID)
-	}
-	for _, ap := range c.ConsulAddrs {
-		fam := "ip"
-		if !ap.Addr().Is4() {
-			fam = "ip6"
+	// Consul API: only the netblock watch task (its own cgroup, plus skuid with run_as); see cgroup.go.
+	if ex.Kind != ExemptNone {
+		owner := ex.match()
+		for _, ap := range c.ConsulAddrs {
+			fam := "ip"
+			if !ap.Addr().Is4() {
+				fam = "ip6"
+			}
+			fmt.Fprintf(&b, "    %s%s daddr %s tcp dport %d counter name \"consul_exempt\" accept comment \"consul\"\n", owner, fam, ap.Addr(), ap.Port())
 		}
-		fmt.Fprintf(&b, "    %s%s daddr %s tcp dport %d counter accept comment \"consul\"\n", owner, fam, ap.Addr(), ap.Port())
 	}
 	b.WriteString("    meta l4proto { tcp, udp } ip daddr . th dport @svc4 counter name \"allowed_svc\" accept\n")
 	b.WriteString("    meta l4proto { tcp, udp } ip6 daddr . th dport @svc6 counter name \"allowed_svc\" accept\n")

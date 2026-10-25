@@ -101,10 +101,10 @@ func TestConfigConsulAddrsRunAs(t *testing.T) {
 	if len(c.ConsulAddrs) != 3 || c.RunAsUID != 65532 || c.RunAsGID != 65532 {
 		t.Fatalf("%+v", c)
 	}
-	rs := RenderRuleset(c, nil)
+	rs := RenderRuleset(c, nil, uidFallback(c))
 	for _, want := range []string{
-		`meta skuid 65532 ip daddr 192.0.2.1 tcp dport 8501 counter accept comment "consul"`,
-		`meta skuid 65532 ip6 daddr 2001:db8::1 tcp dport 8501 counter accept`,
+		`meta skuid 65532 ip daddr 192.0.2.1 tcp dport 8501 counter name "consul_exempt" accept comment "consul"`,
+		`meta skuid 65532 ip6 daddr 2001:db8::1 tcp dport 8501 counter name "consul_exempt" accept`,
 		`meta skuid 65532 ip daddr 192.0.2.10 tcp dport 8501`,
 	} {
 		if !strings.Contains(rs, want) {
@@ -122,7 +122,7 @@ func TestConfigConsulAddrsRunAs(t *testing.T) {
 		}
 	}
 	c, _ = parse(t, "allow_services = a\nconsul_addr = 1.2.3.4:8501\n")
-	if strings.Contains(RenderRuleset(c, nil), "skuid") {
+	if strings.Contains(RenderRuleset(c, nil, initExempt(c)), "skuid") {
 		t.Error("skuid without run_as")
 	}
 }

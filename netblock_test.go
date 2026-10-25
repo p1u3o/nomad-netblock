@@ -105,14 +105,14 @@ func TestResolvConf(t *testing.T) {
 
 func TestRenderRulesetEnforce(t *testing.T) {
 	c, _ := parse(t, "allow_cidrs = tcp 192.0.2.10/32 16034; udp 100.64.0.0/10; tcp 2001:db8::/32 80-90\ndns_resolver = 1.1.1.1 2606:4700::1111\nallow_services = x\nconsul_addr = 192.0.2.20:8501\n")
-	s := RenderRuleset(c, []Target{{netip.MustParseAddr("10.0.0.2"), 3306}, {netip.MustParseAddr("fd00::2"), 6379}, {netip.MustParseAddr("10.0.0.1"), 3306}})
+	s := RenderRuleset(c, []Target{{netip.MustParseAddr("10.0.0.2"), 3306}, {netip.MustParseAddr("fd00::2"), 6379}, {netip.MustParseAddr("10.0.0.1"), 3306}}, Exempt{Kind: ExemptOpen})
 	for _, want := range []string{
 		"add table inet netblock\ndelete table inet netblock\n",
 		"policy drop;",
 		`icmpv6 type nd-router-solicit counter name "ipv6_rs" drop`,
 		"ip daddr { 1.1.1.1 } meta l4proto { tcp, udp } th dport 53 counter accept",
 		"ip6 daddr { 2606:4700::1111 }",
-		"ip daddr 192.0.2.20 tcp dport 8501 counter accept",
+		"ip daddr 192.0.2.20 tcp dport 8501 counter name \"consul_exempt\" accept",
 		"ip daddr 192.0.2.10/32 tcp dport 16034 counter accept",
 		"ip daddr 100.64.0.0/10 meta l4proto udp counter accept",
 		"ip6 daddr 2001:db8::/32 tcp dport 80-90 counter accept",
@@ -132,7 +132,7 @@ func TestRenderRulesetEnforce(t *testing.T) {
 
 func TestRenderRulesetAuditAndNoDNS(t *testing.T) {
 	c, _ := parse(t, "mode = audit\nallow_cidrs = tcp 1.2.3.4\ndns_resolver = none\n")
-	s := RenderRuleset(c, nil)
+	s := RenderRuleset(c, nil, Exempt{Kind: ExemptOpen})
 	if !strings.Contains(s, `accept comment "audit mode"`) || strings.Contains(s, "dport 53") || strings.Contains(s, "reject") {
 		t.Fatal(s)
 	}
@@ -407,7 +407,7 @@ func TestNFTIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := r.Apply(RenderRuleset(c, []Target{tg("10.0.0.1:3306"), tg("[fd00::1]:6379")})); err != nil {
+		if err := r.Apply(RenderRuleset(c, []Target{tg("10.0.0.1:3306"), tg("[fd00::1]:6379")}, Exempt{Kind: ExemptCgroup, UID: 65532, CgroupPath: "/", CgroupLevel: 0})); err != nil {
 			t.Fatal(mode, err)
 		}
 		if err := r.Apply(RenderSetUpdate([]Target{tg("10.0.0.2:3306")})); err != nil {
@@ -437,6 +437,9 @@ func TestParseServiceSet(t *testing.T) {
 }
 
 func TestRunWatchCarriesTargetsAndExitsOnCancel(t *testing.T) {
+	oldF, oldR := selfCgroupFile, cgroupRoot
+	defer func() { selfCgroupFile, cgroupRoot = oldF, oldR }()
+	selfCgroupFile, cgroupRoot = fakeCgroupFS(t, "0::/\n")
 	p := t.TempDir() + "/c"
 	os.WriteFile(p, []byte("mode = audit\nallow_cidrs = tcp 1.2.3.4 443\nmetrics_addr =\n"), 0o600)
 	f := &carryNFT{}

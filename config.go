@@ -64,6 +64,7 @@ type Config struct {
 	InitRequireConsul  bool
 	RunAsUID           int // >0: drop to this uid/gid with only CAP_NET_ADMIN; Consul rule matches skuid
 	RunAsGID           int
+	ExemptMatch        string // "auto" (cgroupv2 of the watch task, uid fallback) or "uid"
 }
 
 func defaultConfig() Config {
@@ -78,6 +79,7 @@ func defaultConfig() Config {
 		InitRequireConsul: true,
 		RunAsUID:          -1,
 		RunAsGID:          -1,
+		ExemptMatch:       "auto",
 	}
 }
 
@@ -197,6 +199,11 @@ func ParseConfig(r io.Reader, readResolv func() []netip.Addr) (Config, error) {
 			if err == nil && (c.RunAsUID <= 0 || c.RunAsGID <= 0) {
 				err = fmt.Errorf("run_as must be uid[:gid] > 0, got %q", v)
 			}
+		case "exempt_match":
+			if v != "auto" && v != "uid" {
+				err = fmt.Errorf("exempt_match must be auto or uid, got %q", v)
+			}
+			c.ExemptMatch = v
 		case "consul_ca_file":
 			c.ConsulCAFile = v
 		case "consul_token_file":

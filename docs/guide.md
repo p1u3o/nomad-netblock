@@ -42,6 +42,7 @@ Unknown or duplicate keys are errors (fail closed).
 | `removal_grace` | `60s` | Go duration |
 | `init_require_consul` | `true` | init fails closed if any service could not be fetched |
 | `run_as` | - | `uid[:gid]`: watch drops to this uid with only CAP_NET_ADMIN |
+| `exempt_match` | `auto` | `auto`: Consul exemption by watch's own cgroup (falls back to uid); `uid`: uid match only |
 | `nomad_addr`, `nomad_token_file` | Task API socket, `$NOMAD_TOKEN` | overrides for Nomad service discovery |
 
 Example:
@@ -72,6 +73,16 @@ watch starts as root, re-execs itself as the given uid/gid with an empty group l
 
 **Caveat:** skuid is only a real boundary if the app cannot change its uid. If the app runs as root with
 CAP_SETUID/SETGID, add `cap_drop = ["setuid", "setgid"]` or run it as a non-root user.
+
+## Consul exemption by cgroup (0.3.2, `exempt_match = auto`)
+A uid match alone also lets any other process in the alloc that runs as the same uid reach Consul. Since 0.3.2 watch
+reads its own cgroup from /proc/self/cgroup and the Consul rules match `socket cgroupv2 level N "<path>"` (plus
+`meta skuid` when `run_as` is set). With Docker's private cgroup namespace this is `level 0 "/"`, which needs a kernel
+where nft_socket resolves cgroup paths relative to the inserting task's cgroup namespace (tested on EL9 5.14.0-687).
+After applying, watch probes the Consul endpoints and reads the `consul_exempt` counter; if the cgroup cannot be used
+(missing, deleted, cgroup v1) or the counter stays at 0 it logs `CGROUP EXEMPT FALLBACK: ...` and uses the uid match.
+init runs in another container and cannot name watch's cgroup, so with `run_as` set init has no Consul exemption (it
+fetches before applying its rules). `exempt_match = uid` keeps the 0.3.1 behaviour.
 
 ## Nomad native services
 `allow_nomad_services` uses blocking queries on `/v1/service/<name>` through the Task API socket
