@@ -1,0 +1,5 @@
+/netblock
+/netblock-linux-*
+*.test
+*.out
+.DS_Store

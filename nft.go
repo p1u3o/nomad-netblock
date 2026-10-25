@@ -1,0 +1,321 @@
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"net/netip"
+	"os/exec"
+	"sort"
+	"strings"
+)
+
+const (
+	tableName  = "netblock"
+	logPrefix  = "netblock-drop "
+	dropSetTTL = "24h"
+)
+
+// Target is one ip . port element of a service set.
+type Target struct {
+	Addr netip.Addr
+	Port uint16
+}
+
+func (t Target) String() string { return netip.AddrPortFrom(t.Addr, t.Port).String() }
+
+// Runner applies an nft script atomically (nft -f is one transaction) and lists objects.
+type Runner interface {
+	Apply(script string) error
+	ListJSON(args ...string) ([]byte, error)
+}
+
+type execRunner struct{ bin string }
+
+func (e execRunner) Apply(script string) error {
+	cmd := exec.Command(e.bin, "-f", "-")
+	cmd.Stdin = strings.NewReader(script)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("nft -f: %v: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	return nil
+}
+
+func (e execRunner) ListJSON(args ...string) ([]byte, error) {
+	out, err := exec.Command(e.bin, append([]string{"-j", "list"}, args...)...).Output()
+	if err != nil {
+		return nil, fmt.Errorf("nft -j list %s: %v", strings.Join(args, " "), err)
+	}
+	return out, nil
+}
+
+func addrList(as []netip.Addr, v6 bool) string {
+	var s []string
+	for _, a := range as {
+		if u := a.Unmap(); u.Is4() != v6 {
+			s = append(s, u.String())
+		}
+	}
+	return strings.Join(s, ", ")
+}
+
+func dnsRules(b *strings.Builder, res []netip.Addr) {
+	if v4 := addrList(res, false); v4 != "" {
+		fmt.Fprintf(b, "    ip daddr { %s } meta l4proto { tcp, udp } th dport 53 counter accept\n", v4)
+	}
+	if v6 := addrList(res, true); v6 != "" {
+		fmt.Fprintf(b, "    ip6 daddr { %s } meta l4proto { tcp, udp } th dport 53 counter accept\n", v6)
+	}
+}
+
+func header(b *strings.Builder) {
+	// Create-then-delete makes the replace work whether or not the table exists; one transaction.
+	fmt.Fprintf(b, "add table inet %s\ndelete table inet %s\n", tableName, tableName)
+}
+
+func elemList(ts []Target) string {
+	var s []string
+	for _, t := range ts {
+		s = append(s, fmt.Sprintf("%s . %d", t.Addr.Unmap(), t.Port))
+	}
+	return strings.Join(s, ", ")
+}
+
+func splitFamilies(ts []Target) (v4, v6 []Target) {
+	for _, t := range ts {
+		if t.Addr.Unmap().Is4() {
+			v4 = append(v4, Target{t.Addr.Unmap(), t.Port})
+		} else {
+			v6 = append(v6, t)
+		}
+	}
+	sortTargets(v4)
+	sortTargets(v6)
+	return
+}
+
+func sortTargets(ts []Target) {
+	sort.Slice(ts, func(i, j int) bool {
+		if c := ts[i].Addr.Compare(ts[j].Addr); c != 0 {
+			return c < 0
+		}
+		return ts[i].Port < ts[j].Port
+	})
+}
+
+// RenderRuleset builds the full table. Policy is drop for both families in every mode;
+// audit mode only changes the final verdict for packets that would have been dropped.
+func RenderRuleset(c Config, targets []Target) string {
+	var b strings.Builder
+	header(&b)
+	fmt.Fprintf(&b, "table inet %s {\n", tableName)
+	b.WriteString("  set svc4 { type ipv4_addr . inet_service; }\n")
+	b.WriteString("  set svc6 { type ipv6_addr . inet_service; }\n")
+	fmt.Fprintf(&b, "  set drop4 { type inet_proto . ipv4_addr . inet_service; size 4096; flags dynamic,timeout; timeout %s; }\n", dropSetTTL)
+	fmt.Fprintf(&b, "  set drop6 { type inet_proto . ipv6_addr . inet_service; size 4096; flags dynamic,timeout; timeout %s; }\n", dropSetTTL)
+	b.WriteString("  counter would_drop {}\n  counter allowed_svc {}\n  counter ipv6_rs {}\n")
+	b.WriteString("  chain output {\n    type filter hook output priority filter; policy drop;\n")
+	b.WriteString("    oif \"lo\" accept\n    ct state established,related accept\n    ct state invalid drop\n")
+	if !c.DNSNone {
+		dnsRules(&b, c.DNSResolvers)
+	}
+	// Consul API: only the netblock process (skuid) when run_as is set, so the app cannot reach it.
+	owner := ""
+	if c.RunAsUID > 0 {
+		owner = fmt.Sprintf("meta skuid %d ", c.RunAsUID)
+	}
+	for _, ap := range c.ConsulAddrs {
+		fam := "ip"
+		if !ap.Addr().Is4() {
+			fam = "ip6"
+		}
+		fmt.Fprintf(&b, "    %s%s daddr %s tcp dport %d counter accept comment \"consul\"\n", owner, fam, ap.Addr(), ap.Port())
+	}
+	b.WriteString("    meta l4proto { tcp, udp } ip daddr . th dport @svc4 counter name \"allowed_svc\" accept\n")
+	b.WriteString("    meta l4proto { tcp, udp } ip6 daddr . th dport @svc6 counter name \"allowed_svc\" accept\n")
+	for _, r := range c.AllowCIDRs {
+		fam := "ip"
+		if r.Prefix.Addr().Is6() {
+			fam = "ip6"
+		}
+		switch {
+		case r.PortLo == 0:
+			fmt.Fprintf(&b, "    %s daddr %s meta l4proto %s counter accept\n", fam, r.Prefix, r.Proto)
+		case r.PortLo == r.PortHi:
+			fmt.Fprintf(&b, "    %s daddr %s %s dport %d counter accept\n", fam, r.Prefix, r.Proto, r.PortLo)
+		default:
+			fmt.Fprintf(&b, "    %s daddr %s %s dport %d-%d counter accept\n", fam, r.Prefix, r.Proto, r.PortLo, r.PortHi)
+		}
+	}
+	// IPv6 router solicitations: the kernel retries forever with backoff (router_solicitations=-1), which showed up
+	// as unexplained drops. Always drop them silently with their own counter (no log, not in would_drop).
+	b.WriteString("    icmpv6 type nd-router-solicit counter name \"ipv6_rs\" drop comment \"ipv6 RS noise\"\n")
+	// Everything below is a (would-be) drop: record dest per element, count, rate-limited log.
+	b.WriteString("    meta nfproto ipv4 meta l4proto { tcp, udp } add @drop4 { meta l4proto . ip daddr . th dport counter }\n")
+	b.WriteString("    meta nfproto ipv6 meta l4proto { tcp, udp } add @drop6 { meta l4proto . ip6 daddr . th dport counter }\n")
+	fmt.Fprintf(&b, "    counter name \"would_drop\" limit rate 6/minute log prefix %q level warn\n", logPrefix)
+	if c.Mode == ModeAudit {
+		b.WriteString("    accept comment \"audit mode\"\n")
+	} else {
+		b.WriteString("    meta l4proto tcp reject with tcp reset\n    reject with icmpx admin-prohibited\n")
+	}
+	b.WriteString("  }\n}\n")
+	v4, v6 := splitFamilies(targets)
+	b.WriteString(renderElems(v4, v6, false))
+	return b.String()
+}
+
+// RenderSetUpdate replaces both service sets in one transaction.
+func RenderSetUpdate(targets []Target) string {
+	v4, v6 := splitFamilies(targets)
+	return renderElems(v4, v6, true)
+}
+
+func renderElems(v4, v6 []Target, flush bool) string {
+	var b strings.Builder
+	if flush {
+		fmt.Fprintf(&b, "flush set inet %s svc4\nflush set inet %s svc6\n", tableName, tableName)
+	}
+	if len(v4) > 0 {
+		fmt.Fprintf(&b, "add element inet %s svc4 { %s }\n", tableName, elemList(v4))
+	}
+	if len(v6) > 0 {
+		fmt.Fprintf(&b, "add element inet %s svc6 { %s }\n", tableName, elemList(v6))
+	}
+	return b.String()
+}
+
+// RenderFailClosed is applied when the config is unusable: deny everything except DNS.
+func RenderFailClosed(res []netip.Addr) string {
+	var b strings.Builder
+	header(&b)
+	fmt.Fprintf(&b, "table inet %s {\n  chain output {\n    type filter hook output priority filter; policy drop;\n", tableName)
+	b.WriteString("    oif \"lo\" accept\n    ct state established,related accept\n")
+	dnsRules(&b, res)
+	fmt.Fprintf(&b, "    limit rate 6/minute log prefix %q level warn\n", logPrefix+"failclosed ")
+	b.WriteString("    meta l4proto tcp reject with tcp reset\n    reject with icmpx admin-prohibited\n  }\n}\n")
+	return b.String()
+}
+
+// DropEntry is one recorded (would-be) drop destination with its counters.
+type DropEntry struct {
+	Proto   string
+	Dest    netip.AddrPort
+	Packets uint64
+	Bytes   uint64
+}
+
+// ParseDropSet parses `nft -j list set inet netblock dropN`.
+func ParseDropSet(data []byte) ([]DropEntry, error) {
+	var doc struct {
+		Nftables []map[string]json.RawMessage `json:"nftables"`
+	}
+	if err := json.Unmarshal(data, &doc); err != nil {
+		return nil, err
+	}
+	var out []DropEntry
+	for _, obj := range doc.Nftables {
+		raw, ok := obj["set"]
+		if !ok {
+			continue
+		}
+		var set struct {
+			Elem []json.RawMessage `json:"elem"`
+		}
+		if err := json.Unmarshal(raw, &set); err != nil {
+			return nil, err
+		}
+		for _, e := range set.Elem {
+			var w struct {
+				Elem struct {
+					Val struct {
+						Concat []json.RawMessage `json:"concat"`
+					} `json:"val"`
+					Counter struct {
+						Packets uint64 `json:"packets"`
+						Bytes   uint64 `json:"bytes"`
+					} `json:"counter"`
+				} `json:"elem"`
+			}
+			if err := json.Unmarshal(e, &w); err != nil || len(w.Elem.Val.Concat) != 3 {
+				continue
+			}
+			var proto, ip string
+			var port uint16
+			if json.Unmarshal(w.Elem.Val.Concat[0], &proto) != nil ||
+				json.Unmarshal(w.Elem.Val.Concat[1], &ip) != nil ||
+				json.Unmarshal(w.Elem.Val.Concat[2], &port) != nil {
+				continue
+			}
+			a, err := netip.ParseAddr(ip)
+			if err != nil {
+				continue
+			}
+			out = append(out, DropEntry{proto, netip.AddrPortFrom(a, port), w.Elem.Counter.Packets, w.Elem.Counter.Bytes})
+		}
+	}
+	return out, nil
+}
+
+// ParseNamedCounter parses `nft -j list counter inet netblock <name>`.
+func ParseNamedCounter(data []byte) (packets, bytes uint64, err error) {
+	var doc struct {
+		Nftables []struct {
+			Counter *struct {
+				Packets uint64 `json:"packets"`
+				Bytes   uint64 `json:"bytes"`
+			} `json:"counter"`
+		} `json:"nftables"`
+	}
+	if err = json.Unmarshal(data, &doc); err != nil {
+		return
+	}
+	for _, o := range doc.Nftables {
+		if o.Counter != nil {
+			return o.Counter.Packets, o.Counter.Bytes, nil
+		}
+	}
+	return 0, 0, fmt.Errorf("no counter in output")
+}
+
+// ParseServiceSet parses `nft -j list set inet netblock svc4|svc6` (ip . port elements).
+func ParseServiceSet(data []byte) ([]Target, error) {
+	var doc struct {
+		Nftables []map[string]json.RawMessage `json:"nftables"`
+	}
+	if err := json.Unmarshal(data, &doc); err != nil {
+		return nil, err
+	}
+	var out []Target
+	for _, obj := range doc.Nftables {
+		raw, ok := obj["set"]
+		if !ok {
+			continue
+		}
+		var set struct {
+			Elem []json.RawMessage `json:"elem"`
+		}
+		if err := json.Unmarshal(raw, &set); err != nil {
+			return nil, err
+		}
+		for _, e := range set.Elem {
+			var c struct {
+				Concat []json.RawMessage `json:"concat"`
+			}
+			if json.Unmarshal(e, &c) != nil || len(c.Concat) != 2 {
+				continue
+			}
+			var ip string
+			var port uint16
+			if json.Unmarshal(c.Concat[0], &ip) != nil || json.Unmarshal(c.Concat[1], &port) != nil {
+				continue
+			}
+			if a, err := netip.ParseAddr(ip); err == nil {
+				out = append(out, Target{a, port})
+			}
+		}
+	}
+	return out, nil
+}
