@@ -18,15 +18,18 @@ import (
 	"time"
 )
 
-var version = "0.3.2"
+var version = "0.4.0-rc5"
 
 const (
 	defaultConfPath = "/local/netblock.conf"
 	resolvPath      = "/etc/resolv.conf"
 )
 
+// logName is the log prefix; the netpush mode sets it to "netpush".
+var logName = "netblock"
+
 func logf(format string, a ...any) {
-	fmt.Fprintf(os.Stderr, "%s netblock: %s\n", time.Now().UTC().Format(time.RFC3339), fmt.Sprintf(format, a...))
+	fmt.Fprintf(os.Stderr, "%s %s: %s\n", time.Now().UTC().Format(time.RFC3339), logName, fmt.Sprintf(format, a...))
 }
 
 func readResolv() []netip.Addr {
@@ -49,7 +52,7 @@ func loadConfig(path string) (Config, error) {
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: netblock init|watch|version [config]")
+		fmt.Fprintln(os.Stderr, "usage: netblock init|watch|netpush|version [config]")
 		os.Exit(64)
 	}
 	path := defaultConfPath
@@ -72,6 +75,13 @@ func main() {
 		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 		defer stop()
 		os.Exit(runWatch(ctx, path, nft))
+	case "netpush":
+		if len(os.Args) <= 2 {
+			path = defaultNetpushConfPath
+		}
+		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+		defer stop()
+		os.Exit(runNetpush(ctx, path))
 	case "version":
 		fmt.Println(version)
 	default:
@@ -250,6 +260,7 @@ func runWatch(ctx context.Context, path string, nft Runner) int {
 		return 1
 	}
 	logf("watch: ruleset applied mode=%s static=%d carried_targets=%d consul_exempt=%s", c.Mode, len(c.AllowCIDRs), len(carried), ex)
+	logLockdown(c, ex)
 	if ex.Kind == ExemptCgroup && len(c.ConsulAddrs) > 0 {
 		ex = verifyExempt(ctx, c, nft, carried, ex)
 	}
@@ -268,6 +279,50 @@ func runWatch(ctx context.Context, path string, nft Runner) int {
 			}
 		}()
 		defer srv.Close()
+	}
+	// netpush peer exemption (peer.go).
+	var peerCh chan peerReg
+	var odReqs chan odRequest
+	if c.OnDemandPool.IsValid() {
+		odReqs = make(chan odRequest)
+	}
+	if c.NetpushSocket != "" && (len(c.ConsulAddrs) > 0 || odReqs != nil) {
+		switch {
+		case c.NetpushMatch == "uid" || ex.Kind != ExemptCgroup:
+			if c.NetpushUID > 0 {
+				ex.Peer = &PeerExempt{ByUID: true, UID: c.NetpushUID}
+				logf("watch: NETPUSH EXEMPT UID FALLBACK: netpush_match=%s watch exemption=%s; netpush Consul traffic exempted by uid %d only (any process with that uid in the alloc gets Consul)", c.NetpushMatch, ex, c.NetpushUID)
+				if err := nft.Apply(RenderRuleset(c, carried, ex)); err != nil {
+					logf("watch: netpush uid exemption apply failed: %v", err)
+					ex.Peer = nil
+				}
+				logLockdown(c, ex)
+			} else {
+				logf("watch: NETPUSH EXEMPT DISABLED: no cgroup match and no netpush_uid; netpush gets no Consul access")
+			}
+			if odReqs != nil {
+				// On-demand requests still use the peer socket; the cgroup is not used.
+				ignored := make(chan peerReg)
+				go func() {
+					for r := range ignored {
+						r.f.Close()
+					}
+				}()
+				go servePeer(ctx, c, 0, ignored, odReqs)
+			}
+		default:
+			ownID, err := cgroupID(cgroupRoot)
+			if err != nil {
+				logf("watch: NETPUSH EXEMPT DISABLED: own cgroup id: %v", err)
+				break
+			}
+			peerCh = make(chan peerReg)
+			go servePeer(ctx, c, ownID, peerCh, odReqs)
+		}
+		m.with(func() { m.netpushPeer = "waiting" })
+		if ex.Peer != nil {
+			m.with(func() { m.netpushPeer = ex.Peer.String() })
+		}
 	}
 	updates := make(chan update, 16)
 	var wg sync.WaitGroup
@@ -290,6 +345,18 @@ func runWatch(ctx context.Context, path string, nft Runner) int {
 	dropTick := time.NewTicker(15 * time.Second)
 	defer dropTick.Stop()
 	ready := map[string]bool{}
+	od := &onDemandSources{c: c, cc: cc, have: map[string]bool{}, pending: map[string][]chan error{}}
+	for _, s := range srcs {
+		od.have[s.key] = true
+	}
+	nsrc := len(srcs)
+	syncAll := func() {
+		if len(ready) != nsrc {
+			return
+		}
+		err := w.sync(time.Now())
+		od.answer(ready, err)
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -300,15 +367,54 @@ func runWatch(ctx context.Context, path string, nft Runner) int {
 			tr.Update(u.service, u.targets, time.Now())
 			ready[u.service] = true
 			// Until every service has reported once, do not flush targets init installed.
-			if len(ready) == len(srcs) {
-				w.sync(time.Now())
-			}
+			syncAll()
 		case <-tick.C:
-			if len(ready) == len(srcs) {
-				w.sync(time.Now())
+			syncAll()
+		case r := <-odReqs:
+			s, isNew, err := od.add(r)
+			if err != nil {
+				logf("watch: on-demand allow %s %s refused: %v", r.kind, r.name, err)
+				r.reply <- err
+				continue
 			}
+			if isNew {
+				nsrc++
+				logf("watch: on-demand allow: watching %s service %s", r.kind, s.key)
+				wg.Add(1)
+				go func(s source) { defer wg.Done(); watchService(ctx, s, m, updates) }(s)
+				m.with(func() { m.onDemandSources = len(od.have) - len(srcs) })
+			}
+			syncAll()
+		case r := <-peerCh:
+			old := setPeerFile(r.f)
+			prev := ex.Peer
+			ex.Peer = &PeerExempt{ID: r.id, UID: c.NetpushUID}
+			targets := carried
+			if w.have {
+				targets = w.applied
+			}
+			if err := nft.Apply(RenderRuleset(c, targets, ex)); err != nil {
+				logf("watch: netpush exemption apply failed (previous rules stay): %v", err)
+				setPeerFile(old)
+				ex.Peer = prev
+				r.f.Close()
+				continue
+			}
+			if old != nil {
+				old.Close()
+			}
+			logf("watch: netpush exemption applied: %s", ex.Peer)
+			logLockdown(c, ex)
+			m.with(func() { m.netpushPeer = ex.Peer.String() })
 		case <-dropTick.C:
 			w.scanDrops()
+			if c.NetpushSocket != "" {
+				if raw, err := nft.ListJSON("counter", "inet", tableName, "netpush_exempt"); err == nil {
+					if p, _, err := ParseNamedCounter(raw); err == nil {
+						m.with(func() { m.netpushPkts = p })
+					}
+				}
+			}
 		}
 	}
 }
@@ -352,7 +458,8 @@ type watcher struct {
 	seenDrops map[string]uint64
 }
 
-func (w *watcher) sync(now time.Time) {
+// sync pushes the effective targets into the sets; the error is the failed apply, if any.
+func (w *watcher) sync(now time.Time) error {
 	eff, graced := w.tr.Effective(now)
 	sizes := w.tr.SetSizes()
 	v4, v6 := splitFamilies(eff)
@@ -362,16 +469,17 @@ func (w *watcher) sync(now time.Time) {
 		w.m.graced = graced
 	})
 	if w.have && sameTargets(eff, w.applied) {
-		return
+		return nil
 	}
 	if err := w.nft.Apply(RenderSetUpdate(eff)); err != nil {
 		w.m.with(func() { w.m.nftErrors++ })
 		logf("watch: set update failed (previous sets stay): %v", err)
-		return
+		return err
 	}
 	logf("watch: sets updated: %d elements (%d in grace): %s", len(eff), graced, targetsDesc(eff))
 	w.applied, w.have = eff, true
 	w.m.with(func() { w.m.applies++ })
+	return nil
 }
 
 func targetsDesc(ts []Target) string {
@@ -423,5 +531,21 @@ func (w *watcher) scanDrops() {
 		if p, _, err := ParseNamedCounter(raw); err == nil {
 			w.m.with(func() { w.m.ipv6RS = p })
 		}
+	}
+}
+
+// logLockdown reports which match the egress lockdown uses right now.
+func logLockdown(c Config, ex Exempt) {
+	if !c.EgressLockdown {
+		return
+	}
+	m, ok := lockdownMatch(c, ex)
+	switch {
+	case !ok:
+		logf("watch: egress lockdown closed until netpush registers its cgroup (only loopback and the Consul exemptions are open)")
+	case lockdownUIDOnly(c, ex):
+		logf("watch: EGRESS LOCKDOWN UID FALLBACK: egress limited by uid %d only (any process with that uid in the alloc gets out)", c.NetpushUID)
+	default:
+		logf("watch: egress lockdown by netpush cgroup: %s", m)
 	}
 }

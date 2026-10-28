@@ -35,6 +35,31 @@ type ConsulClient struct {
 	failUntil []time.Time
 	now       func() time.Time
 	failovers uint64
+	intr      chan struct{} // closed by Interrupt (token reload)
+}
+
+// errInterrupted is returned by requests cut short by Interrupt; callers re-query at once.
+var errInterrupted = errors.New("consul request interrupted for token reload")
+
+func (cc *ConsulClient) interruptCh() chan struct{} {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+	if cc.intr == nil {
+		cc.intr = make(chan struct{})
+	}
+	return cc.intr
+}
+
+// Interrupt cancels in-flight blocking queries and drops idle connections, so the next
+// requests read the token file again (it is read on every request).
+func (cc *ConsulClient) Interrupt() {
+	cc.mu.Lock()
+	if cc.intr != nil {
+		close(cc.intr)
+	}
+	cc.intr = make(chan struct{})
+	cc.mu.Unlock()
+	cc.http.CloseIdleConnections()
 }
 
 func NewConsulClient(c Config) (*ConsulClient, error) {
@@ -145,6 +170,27 @@ type healthEntry struct {
 // X-Consul-Index for the next blocking call, and an error. Critical instances are
 // skipped unless includeCritical.
 func (cc *ConsulClient) Health(ctx context.Context, s ServiceRef, index uint64, wait time.Duration, includeCritical bool) ([]Target, uint64, error) {
+	f := filterNoCritical
+	if includeCritical {
+		f = filterAll
+	}
+	return cc.health(ctx, s, index, wait, f)
+}
+
+// HealthPassing returns only instances whose checks are all passing (netpush upstreams).
+func (cc *ConsulClient) HealthPassing(ctx context.Context, s ServiceRef, index uint64, wait time.Duration) ([]Target, uint64, error) {
+	return cc.health(ctx, s, index, wait, filterPassing)
+}
+
+type healthFilter int
+
+const (
+	filterAll healthFilter = iota
+	filterNoCritical
+	filterPassing
+)
+
+func (cc *ConsulClient) health(ctx context.Context, s ServiceRef, index uint64, wait time.Duration, f healthFilter) ([]Target, uint64, error) {
 	q := url.Values{}
 	if s.DC != "" {
 		q.Set("dc", s.DC)
@@ -165,7 +211,7 @@ func (cc *ConsulClient) Health(ctx context.Context, s ServiceRef, index uint64, 
 		if ctx.Err() != nil {
 			return nil, 0, ctx.Err()
 		}
-		ts, idx, err := cc.healthOnce(ctx, cc.bases[i]+path, s, wait, includeCritical)
+		ts, idx, err := cc.healthOnce(ctx, cc.bases[i]+path, s, wait, f)
 		if err == nil {
 			cc.markOK(i)
 			return ts, idx, nil
@@ -180,9 +226,19 @@ func (cc *ConsulClient) Health(ctx context.Context, s ServiceRef, index uint64, 
 	return nil, 0, fmt.Errorf("consul %s: all %d endpoints failed, last: %v", s, len(cc.bases), lastErr)
 }
 
-func (cc *ConsulClient) healthOnce(ctx context.Context, u string, s ServiceRef, wait time.Duration, includeCritical bool) ([]Target, uint64, error) {
+func (cc *ConsulClient) healthOnce(ctx context.Context, u string, s ServiceRef, wait time.Duration, f healthFilter) ([]Target, uint64, error) {
 	ctx, cancel := context.WithTimeout(ctx, wait+30*time.Second)
 	defer cancel()
+	intr := cc.interruptCh()
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		select {
+		case <-intr:
+			cancel()
+		case <-stop:
+		}
+	}()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, 0, err
@@ -198,6 +254,11 @@ func (cc *ConsulClient) healthOnce(ctx context.Context, u string, s ServiceRef, 
 	}
 	resp, err := cc.http.Do(req)
 	if err != nil {
+		select {
+		case <-intr:
+			return nil, 0, errInterrupted
+		default:
+		}
 		return nil, 0, retryable{err}
 	}
 	defer resp.Body.Close()
@@ -212,24 +273,34 @@ func (cc *ConsulClient) healthOnce(ctx context.Context, u string, s ServiceRef, 
 	newIndex, _ := strconv.ParseUint(resp.Header.Get("X-Consul-Index"), 10, 64)
 	var entries []healthEntry
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 16<<20)).Decode(&entries); err != nil {
+		select {
+		case <-intr:
+			return nil, 0, errInterrupted
+		default:
+		}
 		return nil, 0, retryable{fmt.Errorf("consul %s: decode: %v", s, err)}
 	}
-	return entriesToTargets(entries, includeCritical), newIndex, nil
+	return filterEntries(entries, f), newIndex, nil
 }
 
 func entriesToTargets(entries []healthEntry, includeCritical bool) []Target {
+	if includeCritical {
+		return filterEntries(entries, filterAll)
+	}
+	return filterEntries(entries, filterNoCritical)
+}
+
+func filterEntries(entries []healthEntry, f healthFilter) []Target {
 	var out []Target
 	for _, e := range entries {
-		if !includeCritical {
-			crit := false
-			for _, c := range e.Checks {
-				if c.Status == "critical" {
-					crit = true
-				}
+		skip := false
+		for _, c := range e.Checks {
+			if (f == filterNoCritical && c.Status == "critical") || (f == filterPassing && c.Status != "passing") {
+				skip = true
 			}
-			if crit {
-				continue
-			}
+		}
+		if skip {
+			continue
 		}
 		addr := e.Service.Address
 		if addr == "" {

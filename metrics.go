@@ -10,20 +10,23 @@ import (
 
 // Metrics is a tiny Prometheus text-format registry (stdlib only, no client library).
 type Metrics struct {
-	mu           sync.Mutex
-	mode         Mode
-	setSize      map[string]int // service -> live instances
-	effective    map[string]int // svc4/svc6 -> elements in nft
-	graced       int
-	consulErrors map[string]uint64
-	nftErrors    uint64
-	applies      uint64
-	lastSync     map[string]float64
-	drops        map[string]DropEntry // key proto/dest
-	dropService  map[string]string
-	wouldDrop    uint64
-	ipv6RS       uint64
-	consul       func() (current string, failovers uint64)
+	mu              sync.Mutex
+	mode            Mode
+	setSize         map[string]int // service -> live instances
+	effective       map[string]int // svc4/svc6 -> elements in nft
+	graced          int
+	consulErrors    map[string]uint64
+	nftErrors       uint64
+	applies         uint64
+	lastSync        map[string]float64
+	drops           map[string]DropEntry // key proto/dest
+	dropService     map[string]string
+	wouldDrop       uint64
+	ipv6RS          uint64
+	consul          func() (current string, failovers uint64)
+	netpushPeer     string // "" = no netpush exemption configured
+	netpushPkts     uint64
+	onDemandSources int
 }
 
 func NewMetrics(mode Mode) *Metrics {
@@ -52,6 +55,11 @@ func (m *Metrics) Write(w io.Writer) {
 	audit := 0
 	if m.mode == ModeAudit {
 		audit = 1
+	}
+	if m.netpushPeer != "" {
+		fmt.Fprintf(w, "# HELP netblock_netpush_exempt_info Current netpush Consul exemption.\n# TYPE netblock_netpush_exempt_info gauge\nnetblock_netpush_exempt_info{match=\"%s\"} 1\n", esc(m.netpushPeer))
+		fmt.Fprintf(w, "# HELP netblock_ondemand_services Services added to the allow sets by netpush on-demand lookups.\n# TYPE netblock_ondemand_services gauge\nnetblock_ondemand_services %d\n", m.onDemandSources)
+		fmt.Fprintf(w, "# HELP netblock_netpush_exempt_packets Packets accepted by the netpush Consul exemption.\n# TYPE netblock_netpush_exempt_packets counter\nnetblock_netpush_exempt_packets %d\n", m.netpushPkts)
 	}
 	fmt.Fprintf(w, "# HELP netblock_audit_mode 1 when would-be drops are accepted.\n# TYPE netblock_audit_mode gauge\nnetblock_audit_mode %d\n", audit)
 	fmt.Fprintln(w, "# HELP netblock_service_instances Live instances per allowed Consul service.\n# TYPE netblock_service_instances gauge")

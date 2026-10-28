@@ -42,6 +42,47 @@ type Exempt struct {
 	UID         int
 	CgroupPath  string // as passed to nft: relative to /sys/fs/cgroup, "/" for the namespace root
 	CgroupLevel int
+	Peer        *PeerExempt // netpush task, if registered (rules use the peer fd, see peer.go)
+}
+
+// PeerExempt is the netpush task's exemption: its cgroup (by the fd it handed over, passed to
+// nft as fd 3) at the same level as the watch cgroup, or its uid as the fallback.
+type PeerExempt struct {
+	ID    uint64 // cgroup id (inode) of the netpush task cgroup
+	UID   int    // >0: also/only match meta skuid
+	ByUID bool   // uid fallback: no cgroup match
+}
+
+// peerCgroupNftPath makes nft stat "/sys/fs/cgroup/../../../proc/self/fd/3", i.e. the cgroup
+// directory fd netpush handed over (nft gets it as ExtraFiles[0]); nft stores its inode (the
+// cgroup id), so a sibling task's cgroup can be named although it is not visible in our
+// cgroup namespace.
+const peerCgroupNftPath = "../../../proc/self/fd/3"
+
+func (p *PeerExempt) String() string {
+	if p.ByUID {
+		return fmt.Sprintf("uid %d", p.UID)
+	}
+	s := fmt.Sprintf("cgroup id %d", p.ID)
+	if p.UID > 0 {
+		s += fmt.Sprintf(" + uid %d", p.UID)
+	}
+	return s
+}
+
+func (e Exempt) peerMatch() string {
+	p := e.Peer
+	if p == nil {
+		return ""
+	}
+	if p.ByUID {
+		return fmt.Sprintf("meta skuid %d ", p.UID)
+	}
+	s := fmt.Sprintf("socket cgroupv2 level %d %q ", e.CgroupLevel, peerCgroupNftPath)
+	if p.UID > 0 {
+		s += fmt.Sprintf("meta skuid %d ", p.UID)
+	}
+	return s
 }
 
 func (e Exempt) String() string {

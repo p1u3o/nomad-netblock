@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -124,5 +125,32 @@ func TestConfigConsulAddrsRunAs(t *testing.T) {
 	c, _ = parse(t, "allow_services = a\nconsul_addr = 1.2.3.4:8501\n")
 	if strings.Contains(RenderRuleset(c, nil, initExempt(c)), "skuid") {
 		t.Error("skuid without run_as")
+	}
+}
+
+func TestFilterEntriesPassing(t *testing.T) {
+	mk := func(port int, st ...string) healthEntry {
+		var e healthEntry
+		e.Service.Address, e.Service.Port = "10.0.0.1", port
+		for _, s := range st {
+			e.Checks = append(e.Checks, struct{ Status string }{s})
+		}
+		return e
+	}
+	es := []healthEntry{mk(1, "passing"), mk(2, "passing", "warning"), mk(3, "critical"), mk(4)}
+	got := func(f healthFilter) (ps []uint16) {
+		for _, t := range filterEntries(es, f) {
+			ps = append(ps, t.Port)
+		}
+		return
+	}
+	if g := fmt.Sprint(got(filterPassing)); g != "[1 4]" {
+		t.Errorf("passing %s", g)
+	}
+	if g := fmt.Sprint(got(filterNoCritical)); g != "[1 2 4]" {
+		t.Errorf("nocrit %s", g)
+	}
+	if g := fmt.Sprint(got(filterAll)); g != "[1 2 3 4]" {
+		t.Errorf("all %s", g)
 	}
 }

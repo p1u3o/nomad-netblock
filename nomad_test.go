@@ -24,7 +24,7 @@ func TestNomadServicesUnixSocket(t *testing.T) {
 		}
 		gotQ = append(gotQ, r.URL.RawQuery)
 		w.Header().Set("X-Nomad-Index", "42")
-		w.Write([]byte(`[{"Address":"198.51.100.2","Port":8080,"NodeID":"n1"},{"Address":"2001:db8::5","Port":443},{"Address":"host.example","Port":1}]`))
+		w.Write([]byte(`[{"Address":"192.0.2.30","Port":8080,"NodeID":"n1"},{"Address":"2001:db8::5","Port":443},{"Address":"host.example","Port":1}]`))
 	})}
 	go srv.Serve(l)
 	defer srv.Close()
@@ -40,7 +40,7 @@ func TestNomadServicesUnixSocket(t *testing.T) {
 		t.Fatalf("%v %v %v", srcs, cc, err)
 	}
 	ts, idx, err := srcs[0].fetch(context.Background(), 0, 0)
-	if err != nil || idx != 42 || len(ts) != 2 || ts[0].String() != "198.51.100.2:8080" || ts[1].String() != "[2001:db8::5]:443" {
+	if err != nil || idx != 42 || len(ts) != 2 || ts[0].String() != "192.0.2.30:8080" || ts[1].String() != "[2001:db8::5]:443" {
 		t.Fatalf("%v %d %v", ts, idx, err)
 	}
 	if _, _, err := srcs[0].fetch(context.Background(), 42, 5*time.Second); err != nil {

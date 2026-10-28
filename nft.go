@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/netip"
+	"os"
 	"os/exec"
 	"sort"
 	"strings"
@@ -35,6 +36,9 @@ type execRunner struct{ bin string }
 func (e execRunner) Apply(script string) error {
 	cmd := exec.Command(e.bin, "-f", "-")
 	cmd.Stdin = strings.NewReader(script)
+	if f := currentPeerFile(); f != nil {
+		cmd.ExtraFiles = []*os.File{f} // fd 3, see peerCgroupNftPath
+	}
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
@@ -61,12 +65,76 @@ func addrList(as []netip.Addr, v6 bool) string {
 	return strings.Join(s, ", ")
 }
 
-func dnsRules(b *strings.Builder, res []netip.Addr) {
+func dnsRules(b *strings.Builder, res []netip.Addr, owner string) {
 	if v4 := addrList(res, false); v4 != "" {
-		fmt.Fprintf(b, "    ip daddr { %s } meta l4proto { tcp, udp } th dport 53 counter accept\n", v4)
+		fmt.Fprintf(b, "    %sip daddr { %s } meta l4proto { tcp, udp } th dport 53 counter accept\n", owner, v4)
 	}
 	if v6 := addrList(res, true); v6 != "" {
-		fmt.Fprintf(b, "    ip6 daddr { %s } meta l4proto { tcp, udp } th dport 53 counter accept\n", v6)
+		fmt.Fprintf(b, "    %sip6 daddr { %s } meta l4proto { tcp, udp } th dport 53 counter accept\n", owner, v6)
+	}
+}
+
+// lockdownMatch is the rule prefix that limits egress to netpush (egress_lockdown = netpush).
+// ok=false means the lockdown rules are left out entirely (fail closed).
+//
+// With a registered netpush peer in cgroup mode the match is the netpush task cgroup (the
+// fd it handed over, same as the Consul exemption) plus its uid, so another process with
+// the same uid in a different task (the app can setuid as root) does not get through.
+// The uid alone is used only as the fallback (peer registered by uid, netpush_match = uid,
+// or no netpush_socket); watch logs that loudly. Before netpush has registered in auto mode
+// nothing matches.
+func lockdownMatch(c Config, ex Exempt) (m string, ok bool) {
+	if !c.EgressLockdown || c.NetpushUID <= 0 {
+		return "", true
+	}
+	if p := ex.Peer; p != nil {
+		if p.ByUID {
+			return fmt.Sprintf("meta skuid %d ", p.UID), true
+		}
+		q := *p
+		q.UID = c.NetpushUID
+		e := ex
+		e.Peer = &q
+		return e.peerMatch(), true
+	}
+	if c.NetpushMatch == "uid" || c.NetpushSocket == "" {
+		return fmt.Sprintf("meta skuid %d ", c.NetpushUID), true
+	}
+	return "", false
+}
+
+// lockdownUIDOnly reports whether the lockdown currently relies on the uid alone.
+func lockdownUIDOnly(c Config, ex Exempt) bool {
+	m, ok := lockdownMatch(c, ex)
+	return c.EgressLockdown && ok && m != "" && !strings.Contains(m, "cgroupv2")
+}
+
+// natRules renders the on-demand redirect and the port-53 redirect (nil when both are off).
+//
+// TCP to the on-demand pool: REDIRECT in the nat output hook. It works for locally generated
+// traffic, netpush needs no capability, and SO_ORIGINAL_DST gives it the original address.
+// UDP to the pool: TPROXY in prerouting (loopback traffic passes prerouting on lo). REDIRECT
+// would rewrite the destination and an unprivileged process cannot get it back for UDP
+// (no SO_ORIGINAL_DST; IP_ORIGDSTADDR returns the rewritten address). TPROXY leaves the
+// packet unchanged and only assigns it to the listener, so IP_ORIGDSTADDR is the original.
+// The listener must have IP_TRANSPARENT (CAP_NET_ADMIN), so watch creates it and hands it to
+// netpush over the peer socket (peer.go); netpush keeps no capability.
+func natRules(b *strings.Builder, c Config) {
+	if c.OnDemandPool.IsValid() || c.DNSRedirect != 0 {
+		b.WriteString("  chain nat_out {\n    type nat hook output priority -100; policy accept;\n")
+		if c.OnDemandPool.IsValid() {
+			fmt.Fprintf(b, "    ip daddr %s meta l4proto tcp counter name \"ondemand_tcp\" redirect to :%d\n", c.OnDemandPool, c.OnDemandPort)
+		}
+		if c.DNSRedirect != 0 {
+			// netpush itself forwards passthrough queries to the real resolvers.
+			fmt.Fprintf(b, "    meta skuid != %d ip daddr != 127.0.0.0/8 meta l4proto { tcp, udp } th dport 53 counter name \"dns_redirect\" redirect to :%d\n", c.NetpushUID, c.DNSRedirect)
+		}
+		b.WriteString("  }\n")
+	}
+	if c.OnDemandPool.IsValid() {
+		b.WriteString("  chain ondemand_pre {\n    type filter hook prerouting priority mangle; policy accept;\n")
+		fmt.Fprintf(b, "    iif \"lo\" ip daddr %s meta l4proto udp counter name \"ondemand_udp\" tproxy ip to 127.0.0.1:%d\n", c.OnDemandPool, c.OnDemandPort)
+		b.WriteString("  }\n")
 	}
 }
 
@@ -115,11 +183,25 @@ func RenderRuleset(c Config, targets []Target, ex Exempt) string {
 	b.WriteString("  set svc6 { type ipv6_addr . inet_service; }\n")
 	fmt.Fprintf(&b, "  set drop4 { type inet_proto . ipv4_addr . inet_service; size 4096; flags dynamic,timeout; timeout %s; }\n", dropSetTTL)
 	fmt.Fprintf(&b, "  set drop6 { type inet_proto . ipv6_addr . inet_service; size 4096; flags dynamic,timeout; timeout %s; }\n", dropSetTTL)
-	b.WriteString("  counter would_drop {}\n  counter allowed_svc {}\n  counter ipv6_rs {}\n  counter consul_exempt {}\n")
+	b.WriteString("  counter would_drop {}\n  counter allowed_svc {}\n  counter ipv6_rs {}\n  counter consul_exempt {}\n  counter netpush_exempt {}\n")
+	if c.OnDemandPool.IsValid() {
+		b.WriteString("  counter ondemand_tcp {}\n  counter ondemand_udp {}\n")
+	}
+	if c.DNSRedirect != 0 {
+		b.WriteString("  counter dns_redirect {}\n")
+	}
+	natRules(&b, c)
+	lock, lockOK := lockdownMatch(c, ex)
 	b.WriteString("  chain output {\n    type filter hook output priority filter; policy drop;\n")
-	b.WriteString("    oif \"lo\" accept\n    ct state established,related accept\n    ct state invalid drop\n")
-	if !c.DNSNone {
-		dnsRules(&b, c.DNSResolvers)
+	b.WriteString("    oif \"lo\" accept\n")
+	if c.DNSRedirect != 0 {
+		// A query redirected away from a remote resolver keeps the original output interface
+		// (oif is not lo) in this hook, so the loopback accept above does not see it.
+		fmt.Fprintf(&b, "    ct status dnat ip daddr 127.0.0.1 meta l4proto { tcp, udp } th dport %d accept\n", c.DNSRedirect)
+	}
+	b.WriteString("    ct state established,related accept\n    ct state invalid drop\n")
+	if !c.DNSNone && lockOK {
+		dnsRules(&b, c.DNSResolvers, lock)
 	}
 	// Consul API: only the netblock watch task (its own cgroup, plus skuid with run_as); see cgroup.go.
 	if ex.Kind != ExemptNone {
@@ -132,20 +214,39 @@ func RenderRuleset(c Config, targets []Target, ex Exempt) string {
 			fmt.Fprintf(&b, "    %s%s daddr %s tcp dport %d counter name \"consul_exempt\" accept comment \"consul\"\n", owner, fam, ap.Addr(), ap.Port())
 		}
 	}
-	b.WriteString("    meta l4proto { tcp, udp } ip daddr . th dport @svc4 counter name \"allowed_svc\" accept\n")
-	b.WriteString("    meta l4proto { tcp, udp } ip6 daddr . th dport @svc6 counter name \"allowed_svc\" accept\n")
+	// Consul API for the netpush task of the same alloc (peer.go). Only rendered with a
+	// registered peer; with a cgroup match nft needs the peer fd (execRunner passes it).
+	if pm := ex.peerMatch(); pm != "" && (ex.Kind == ExemptCgroup || ex.Peer.ByUID) {
+		for _, ap := range c.ConsulAddrs {
+			fam := "ip"
+			if !ap.Addr().Is4() {
+				fam = "ip6"
+			}
+			fmt.Fprintf(&b, "    %s%s daddr %s tcp dport %d counter name \"netpush_exempt\" accept comment \"netpush consul\"\n", pm, fam, ap.Addr(), ap.Port())
+		}
+	}
+	if !lockOK {
+		b.WriteString("    # egress lockdown: waiting for the netpush task to register its cgroup\n")
+	}
+	if lockOK {
+		fmt.Fprintf(&b, "    %smeta l4proto { tcp, udp } ip daddr . th dport @svc4 counter name \"allowed_svc\" accept\n", lock)
+		fmt.Fprintf(&b, "    %smeta l4proto { tcp, udp } ip6 daddr . th dport @svc6 counter name \"allowed_svc\" accept\n", lock)
+	}
 	for _, r := range c.AllowCIDRs {
+		if !lockOK {
+			break
+		}
 		fam := "ip"
 		if r.Prefix.Addr().Is6() {
 			fam = "ip6"
 		}
 		switch {
 		case r.PortLo == 0:
-			fmt.Fprintf(&b, "    %s daddr %s meta l4proto %s counter accept\n", fam, r.Prefix, r.Proto)
+			fmt.Fprintf(&b, "    %s%s daddr %s meta l4proto %s counter accept\n", lock, fam, r.Prefix, r.Proto)
 		case r.PortLo == r.PortHi:
-			fmt.Fprintf(&b, "    %s daddr %s %s dport %d counter accept\n", fam, r.Prefix, r.Proto, r.PortLo)
+			fmt.Fprintf(&b, "    %s%s daddr %s %s dport %d counter accept\n", lock, fam, r.Prefix, r.Proto, r.PortLo)
 		default:
-			fmt.Fprintf(&b, "    %s daddr %s %s dport %d-%d counter accept\n", fam, r.Prefix, r.Proto, r.PortLo, r.PortHi)
+			fmt.Fprintf(&b, "    %s%s daddr %s %s dport %d-%d counter accept\n", lock, fam, r.Prefix, r.Proto, r.PortLo, r.PortHi)
 		}
 	}
 	// IPv6 router solicitations: the kernel retries forever with backoff (router_solicitations=-1), which showed up
@@ -192,7 +293,7 @@ func RenderFailClosed(res []netip.Addr) string {
 	header(&b)
 	fmt.Fprintf(&b, "table inet %s {\n  chain output {\n    type filter hook output priority filter; policy drop;\n", tableName)
 	b.WriteString("    oif \"lo\" accept\n    ct state established,related accept\n")
-	dnsRules(&b, res)
+	dnsRules(&b, res, "")
 	fmt.Fprintf(&b, "    limit rate 6/minute log prefix %q level warn\n", logPrefix+"failclosed ")
 	b.WriteString("    meta l4proto tcp reject with tcp reset\n    reject with icmpx admin-prohibited\n  }\n}\n")
 	return b.String()

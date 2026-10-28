@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/netip"
+	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -65,6 +66,25 @@ type Config struct {
 	RunAsUID           int // >0: drop to this uid/gid with only CAP_NET_ADMIN; Consul rule matches skuid
 	RunAsGID           int
 	ExemptMatch        string // "auto" (cgroupv2 of the watch task, uid fallback) or "uid"
+
+	// netpush peer exemption (see peer.go): watch listens on NetpushSocket, netpush hands over
+	// an fd of its own cgroup dir, watch adds a cgroupv2 rule for it to the Consul addresses.
+	NetpushSocket    string // "" = off
+	NetpushUID       int    // SO_PEERCRED check and uid fallback (0 = no check / no fallback)
+	NetpushMemoryMax int64  // expected memory.max of the netpush cgroup (0 = no check)
+	NetpushMatch     string // "auto" (cgroupv2, uid fallback) or "uid"
+
+	// netpush on-demand mode (ondemand.go): nft sends all TCP/UDP to OnDemandPool to the
+	// netpush listener on 127.0.0.1:OnDemandPort; netpush may ask watch to add services
+	// matching OnDemandAllow (at most OnDemandMax) to the allow sets.
+	OnDemandPool  netip.Prefix // invalid = off
+	OnDemandPort  uint16
+	OnDemandAllow []string // glob patterns (path.Match); empty = any service
+	OnDemandMax   int
+	// DNSRedirect: redirect port 53 (IPv4, except netpush_uid) to 127.0.0.1:DNSRedirect.
+	DNSRedirect uint16
+	// EgressLockdown: only netpush_uid may use DNS resolvers, service sets and allow_cidrs.
+	EgressLockdown bool
 }
 
 func defaultConfig() Config {
@@ -80,6 +100,9 @@ func defaultConfig() Config {
 		RunAsUID:          -1,
 		RunAsGID:          -1,
 		ExemptMatch:       "auto",
+		NetpushMatch:      "auto",
+		OnDemandPort:      15001,
+		OnDemandMax:       64,
 	}
 }
 
@@ -214,6 +237,43 @@ func ParseConfig(r io.Reader, readResolv func() []netip.Addr) (Config, error) {
 			c.InitRequireConsul, err = strconv.ParseBool(v)
 		case "metrics_addr":
 			c.MetricsAddr = v
+		case "netpush_socket":
+			c.NetpushSocket = v
+		case "netpush_uid":
+			if c.NetpushUID, err = strconv.Atoi(v); err == nil && c.NetpushUID <= 0 {
+				err = fmt.Errorf("netpush_uid must be > 0")
+			}
+		case "netpush_memory_max":
+			c.NetpushMemoryMax, err = strconv.ParseInt(v, 10, 64)
+		case "netpush_match":
+			if v != "auto" && v != "uid" {
+				err = fmt.Errorf("netpush_match must be auto or uid, got %q", v)
+			}
+			c.NetpushMatch = v
+		case "ondemand_pool":
+			if v != "" && v != "none" {
+				c.OnDemandPool, err = parseOnDemandPool(v)
+			}
+		case "ondemand_port":
+			c.OnDemandPort, err = parsePort(v)
+		case "ondemand_allow":
+			c.OnDemandAllow, err = parsePatterns(v)
+		case "ondemand_max":
+			if c.OnDemandMax, err = strconv.Atoi(v); err == nil && c.OnDemandMax <= 0 {
+				err = fmt.Errorf("ondemand_max must be > 0")
+			}
+		case "dns_redirect":
+			if v != "" && v != "none" {
+				c.DNSRedirect, err = parsePort(v)
+			}
+		case "egress_lockdown":
+			switch v {
+			case "netpush":
+				c.EgressLockdown = true
+			case "none", "":
+			default:
+				err = fmt.Errorf("egress_lockdown must be netpush or none")
+			}
 		default:
 			err = fmt.Errorf("unknown key %q", k)
 		}
@@ -224,11 +284,17 @@ func ParseConfig(r io.Reader, readResolv func() []netip.Addr) (Config, error) {
 	if err := sc.Err(); err != nil {
 		return c, err
 	}
-	if !seen["allow_cidrs"] && !seen["allow_services"] && !seen["allow_nomad_services"] {
+	if !seen["allow_cidrs"] && !seen["allow_services"] && !seen["allow_nomad_services"] && !c.OnDemandPool.IsValid() {
 		return c, fmt.Errorf("config has none of allow_cidrs, allow_services, allow_nomad_services")
 	}
 	if len(c.AllowServices) > 0 && len(c.ConsulAddrs) == 0 {
 		return c, fmt.Errorf("allow_services set but consul_addrs missing")
+	}
+	if (c.DNSRedirect != 0 || c.EgressLockdown) && c.NetpushUID <= 0 {
+		return c, fmt.Errorf("dns_redirect and egress_lockdown need netpush_uid")
+	}
+	if c.OnDemandPool.IsValid() && c.NetpushSocket == "" {
+		return c, fmt.Errorf("ondemand_pool needs netpush_socket (netpush asks watch to allow services)")
 	}
 	if !c.DNSNone && len(c.DNSResolvers) == 0 && readResolv != nil {
 		c.DNSResolvers = readResolv()
@@ -316,4 +382,54 @@ func ParseResolvConf(r io.Reader) []netip.Addr {
 		}
 	}
 	return out
+}
+
+// parseOnDemandPool accepts an IPv4 loopback prefix of /16../30 (not 127.0.0.0/24, which holds
+// 127.0.0.1).
+func parseOnDemandPool(v string) (netip.Prefix, error) {
+	p, err := netip.ParsePrefix(v)
+	if err != nil {
+		return p, err
+	}
+	p = p.Masked()
+	if !p.Addr().Is4() || !p.Addr().IsLoopback() || p.Bits() < 16 || p.Bits() > 30 {
+		return p, fmt.Errorf("must be an IPv4 loopback prefix /16../30")
+	}
+	if p.Contains(netip.MustParseAddr("127.0.0.1")) {
+		return p, fmt.Errorf("must not contain 127.0.0.1")
+	}
+	return p, nil
+}
+
+func parsePort(v string) (uint16, error) {
+	n, err := strconv.ParseUint(v, 10, 16)
+	if err != nil || n == 0 {
+		return 0, fmt.Errorf("bad port %q", v)
+	}
+	return uint16(n), nil
+}
+
+// parsePatterns reads a list of service name globs (path.Match syntax, e.g. mx-*).
+func parsePatterns(v string) ([]string, error) {
+	var out []string
+	for _, p := range splitList(v) {
+		if _, err := path.Match(p, ""); err != nil {
+			return nil, fmt.Errorf("pattern %q: %v", p, err)
+		}
+		out = append(out, strings.ToLower(p))
+	}
+	return out, nil
+}
+
+// matchAny reports whether name matches one of the patterns (no patterns = everything).
+func matchAny(pats []string, name string) bool {
+	if len(pats) == 0 {
+		return true
+	}
+	for _, p := range pats {
+		if ok, _ := path.Match(p, name); ok {
+			return true
+		}
+	}
+	return false
 }

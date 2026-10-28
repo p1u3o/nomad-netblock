@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -183,4 +184,95 @@ func buildSources(c Config) ([]source, *ConsulClient, error) {
 		}
 	}
 	return out, cc, nil
+}
+
+// onDemandSources tracks services netpush added through the peer socket (on-demand mode).
+type onDemandSources struct {
+	c       Config
+	cc      *ConsulClient
+	nc      *NomadClient
+	have    map[string]bool // every source key, static and on-demand
+	added   int
+	pending map[string][]chan error // waiting for the first sync that includes the key
+}
+
+// add checks a request against ondemand_allow and ondemand_max and returns the new source
+// (isNew false when the service is already watched).
+func (o *onDemandSources) add(r odRequest) (source, bool, error) {
+	var s source
+	switch r.kind {
+	case "consul":
+		ref, err := parseService(r.name)
+		if err != nil || ref.Tag != "" || ref.DC != "" {
+			return s, false, fmt.Errorf("bad consul service %q", r.name)
+		}
+		if !matchAny(o.c.OnDemandAllow, ref.Name) {
+			return s, false, fmt.Errorf("%s does not match ondemand_allow", ref.Name)
+		}
+		if len(o.c.ConsulAddrs) == 0 {
+			return s, false, errors.New("consul_addrs is not set")
+		}
+		s.key = ref.String()
+		if o.have[s.key] {
+			o.pending[s.key] = append(o.pending[s.key], r.reply)
+			return s, false, nil
+		}
+		if o.cc == nil {
+			cc, err := NewConsulClient(o.c)
+			if err != nil {
+				return s, false, err
+			}
+			o.cc = cc
+		}
+		cc, c := o.cc, o.c
+		s.fetch = func(ctx context.Context, i uint64, w time.Duration) ([]Target, uint64, error) {
+			return cc.Health(ctx, ref, i, w, c.IncludeCritical)
+		}
+	case "nomad":
+		ref, err := parseNomadService(r.name)
+		if err != nil {
+			return s, false, err
+		}
+		if !matchAny(o.c.OnDemandAllow, ref.Name) {
+			return s, false, fmt.Errorf("%s does not match ondemand_allow", ref.Name)
+		}
+		s.key = ref.String()
+		if o.have[s.key] {
+			o.pending[s.key] = append(o.pending[s.key], r.reply)
+			return s, false, nil
+		}
+		if o.nc == nil {
+			nc, err := NewNomadClient(o.c)
+			if err != nil {
+				return s, false, err
+			}
+			o.nc = nc
+		}
+		nc := o.nc
+		s.fetch = func(ctx context.Context, i uint64, w time.Duration) ([]Target, uint64, error) {
+			return nc.Services(ctx, ref, i, w)
+		}
+	default:
+		return s, false, fmt.Errorf("unknown source %q", r.kind)
+	}
+	if o.added >= o.c.OnDemandMax {
+		return s, false, fmt.Errorf("ondemand_max (%d) reached", o.c.OnDemandMax)
+	}
+	o.added++
+	o.have[s.key] = true
+	o.pending[s.key] = append(o.pending[s.key], r.reply)
+	return s, true, nil
+}
+
+// answer replies to requests whose service has reported, after a sync attempt.
+func (o *onDemandSources) answer(ready map[string]bool, err error) {
+	for k, rs := range o.pending {
+		if !ready[k] {
+			continue
+		}
+		for _, r := range rs {
+			r <- err
+		}
+		delete(o.pending, k)
+	}
 }
